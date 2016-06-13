@@ -15,6 +15,7 @@
 #include "storage/proc.h"
 #include "storage/shm_toc.h"
 #include "tcop/tcopprot.h"
+#include "utils/ps_status.h"
 #include "utils/snapmgr.h"
 
 PG_MODULE_MAGIC;
@@ -28,7 +29,7 @@ static volatile sig_atomic_t got_sigterm = false;
 static volatile sig_atomic_t got_sigusr1 = false;
 
 static int			controller_max_workers = 4;
-static int			max_workers_per_db = 2;
+static int			max_workers_per_db = 1;
 
 typedef struct
 {
@@ -226,7 +227,7 @@ cleanup_on_workers_exit()
 
 			if (state->is_valid)
 			{
-				elog(LOG, "worker %s pid: %d ended", WORKER_NAME, pid);
+				elog(LOG, "worker %s pid: %d database: %s ended", WORKER_NAME, pid, slot->dbname);
 				elog(LOG, "exit code: %d, sqlstate: %s, errmsg: %s",
 						  state->exitcode,
 						  unpack_sql_state(state->sqlstate),
@@ -305,11 +306,11 @@ static void
 worker_main(Datum main_arg)
 {
 	int		index;
+	char	buf[MAXPGPATH];
 
 	elog(LOG, "worker %s started", WORKER_NAME);
 
 	pqsignal(SIGTERM, die);
-	pqsignal(SIGINT, StatementCancelHandler);
 	BackgroundWorkerUnblockSignals();
 
 	memcpy(&index, MyBgworkerEntry->bgw_extra, sizeof(int));
@@ -321,6 +322,9 @@ worker_main(Datum main_arg)
 
 	elog(LOG, "worker %s is stared for database: %s",
 						WORKER_NAME, worker_slot->dbname);
+
+	snprintf(buf, MAXPGPATH, "bgworker: %s (%s)", WORKER_NAME, worker_slot->dbname);
+	init_ps_display(buf, "", "", "");
 
 	PG_TRY();
 	{
@@ -334,9 +338,9 @@ worker_main(Datum main_arg)
 
 		SPI_connect();
 		PushActiveSnapshot(GetTransactionSnapshot());
-		pgstat_report_activity(STATE_RUNNING, "select pg_sleep((random()*20)::int)");
+		pgstat_report_activity(STATE_RUNNING, "select pg_sleep((random()*10)::int)");
 
-		SPI_execute("select pg_sleep((random()*20)::int)", false, 1);
+		SPI_execute("select pg_sleep((random()*10)::int)", false, 1);
 
 		SPI_finish();
 		PopActiveSnapshot();
@@ -381,7 +385,7 @@ controller_main(Datum main_arg)
 		int			rc;
 
 		rc = WaitLatch(&MyProc->procLatch,
-						  WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, 5000L);
+						  WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH, 1000L);
 		ResetLatch(&MyProc->procLatch);
 
 		if (rc & WL_POSTMASTER_DEATH)
@@ -459,6 +463,7 @@ controller_main(Datum main_arg)
 							lc = list_head(databases);
 							goto wait;
 						}
+						break;
 					}
 					else
 					{
