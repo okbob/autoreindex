@@ -14,6 +14,7 @@
 #include "storage/latch.h"
 #include "storage/proc.h"
 #include "storage/shm_toc.h"
+#include "tcop/tcopprot.h"
 #include "utils/snapmgr.h"
 
 PG_MODULE_MAGIC;
@@ -269,6 +270,9 @@ get_database_list(void)
 	HeapTuple	tup;
 	List		*result = NIL;
 
+	MemoryContext top_ctx = CurrentMemoryContext;
+	MemoryContext old_ctx;
+
 	StartTransactionCommand();
 	(void) GetTransactionSnapshot();
 
@@ -280,13 +284,19 @@ get_database_list(void)
 		Form_pg_database pgdatabase = (Form_pg_database) GETSTRUCT (tup);
 
 		if (pgdatabase->datallowconn)
+		{
+			old_ctx = MemoryContextSwitchTo(top_ctx);
 			result = lappend(result, pstrdup(NameStr(pgdatabase->datname)));
+			MemoryContextSwitchTo(old_ctx);
+		}
 	}
 
 	heap_endscan(scan);
 	heap_close(rel, AccessShareLock);
 
 	CommitTransactionCommand();
+
+	MemoryContextSwitchTo(top_ctx);
 
 	return result;
 }
@@ -298,7 +308,8 @@ worker_main(Datum main_arg)
 
 	elog(LOG, "worker %s started", WORKER_NAME);
 
-	pqsignal(SIGTERM, handler_sigterm);
+	pqsignal(SIGTERM, die);
+	pqsignal(SIGINT, StatementCancelHandler);
 	BackgroundWorkerUnblockSignals();
 
 	memcpy(&index, MyBgworkerEntry->bgw_extra, sizeof(int));
