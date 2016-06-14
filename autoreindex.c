@@ -15,6 +15,9 @@
 #include "storage/proc.h"
 #include "storage/shm_toc.h"
 #include "tcop/tcopprot.h"
+#include "tcop/pquery.h"
+#include "tcop/utility.h"
+#include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/snapmgr.h"
 
@@ -30,6 +33,8 @@ static volatile sig_atomic_t got_sigusr1 = false;
 
 static int			controller_max_workers = 4;
 static int			max_workers_per_db = 1;
+
+static bool 		verbose = false;
 
 typedef struct
 {
@@ -197,8 +202,9 @@ worker_attach_to_shared_memory(int segmentno, int index)
 	worker_state->sqlstate = 0;
 	worker_state->errormessage[0] = '\0';
 
-	elog(LOG, "%s attached shared memory with index: %d for database: %s",
-					  WORKER_NAME, index, worker_slot->dbname);
+	if (verbose)
+		elog(LOG, "%s attached shared memory with index: %d for database: %s",
+						  WORKER_NAME, index, worker_slot->dbname);
 }
 
 static void
@@ -225,7 +231,7 @@ cleanup_on_workers_exit()
 			WorkerState   *state = &controller->worker_states[i];
 			WorkerProcSlot *slot = &controller->worker_slots[i];
 
-			if (state->is_valid)
+			if (state->is_valid && verbose)
 			{
 				elog(LOG, "worker %s pid: %d database: %s ended", WORKER_NAME, pid, slot->dbname);
 				elog(LOG, "exit code: %d, sqlstate: %s, errmsg: %s",
@@ -253,8 +259,9 @@ terminate_workers()
 	{
 		if (controller->worker_handles[i] != NULL && GetBackgroundWorkerPid(controller->worker_handles[i], &pid) != BGWH_STARTED)
 		{
-			elog(LOG, "terminating worker %s pid: %d because of the controller exit",
-						  WORKER_NAME, pid);
+			if (verbose)
+				elog(LOG, "terminating worker %s pid: %d because of the controller exit",
+							  WORKER_NAME, pid);
 			TerminateBackgroundWorker(controller->worker_handles[i]);
 		}
 	}
@@ -302,13 +309,169 @@ get_database_list(void)
 	return result;
 }
 
+static const char *
+bloat_index_query(void)
+{
+	return
+		"SELECT current_database(), nspname AS schemaname, tblname, idxname, bs*(relpages)::bigint AS real_size,"
+		" bs*(relpages-est_pages)::bigint AS extra_size,"
+		" 100 * (relpages-est_pages)::float / relpages AS extra_ratio,"
+		" fillfactor, bs*(relpages-est_pages_ff) AS bloat_size,"
+		" 100 * (relpages-est_pages_ff)::float / relpages AS bloat_ratio,"
+		" is_na"
+		" FROM ("
+		" SELECT coalesce(1 +"
+		" ceil(reltuples/floor((bs-pageopqdata-pagehdr)/(4+nulldatahdrwidth)::float)), 0"
+		" ) AS est_pages,"
+		" coalesce(1 +"
+		" ceil(reltuples/floor((bs-pageopqdata-pagehdr)*fillfactor/(100*(4+nulldatahdrwidth)::float))), 0"
+		" ) AS est_pages_ff,"
+		" bs, nspname, table_oid, tblname, idxname, relpages, fillfactor, is_na"
+		" FROM ("
+		" SELECT maxalign, bs, nspname, tblname, idxname, reltuples, relpages, relam, table_oid, fillfactor,"
+		" ( index_tuple_hdr_bm +"
+		" maxalign - CASE"
+		" WHEN index_tuple_hdr_bm%maxalign = 0 THEN maxalign"
+		" ELSE index_tuple_hdr_bm%maxalign"
+		" END"
+		" + nulldatawidth + maxalign - CASE"
+		" WHEN nulldatawidth = 0 THEN 0"
+		" WHEN nulldatawidth::integer%maxalign = 0 THEN maxalign"
+		" ELSE nulldatawidth::integer%maxalign"
+		" END"
+		" )::numeric AS nulldatahdrwidth, pagehdr, pageopqdata, is_na"
+		" FROM ("
+		" SELECT"
+		" i.nspname, i.tblname, i.idxname, i.reltuples, i.relpages, i.relam, a.attrelid AS table_oid,"
+		" current_setting(\'block_size\')::numeric AS bs, fillfactor,"
+		" CASE"
+		" WHEN version() ~ \'mingw32\' OR version() ~ \'64-bit|x86_64|ppc64|ia64|amd64\' THEN 8"
+		" ELSE 4"
+		" END AS maxalign,"
+		" 24 AS pagehdr,"
+		" 16 AS pageopqdata,"
+		" CASE WHEN max(coalesce(s.null_frac,0)) = 0"
+		" THEN 2"
+		" ELSE 2 + (( 32 + 8 - 1 ) / 8)"
+		" END AS index_tuple_hdr_bm,"
+		" sum( (1-coalesce(s.null_frac, 0)) * coalesce(s.avg_width, 1024)) AS nulldatawidth,"
+		" max( CASE WHEN a.atttypid = \'pg_catalog.name\'::regtype THEN 1 ELSE 0 END ) > 0 AS is_na"
+		" FROM pg_attribute AS a"
+		" JOIN ("
+		" SELECT nspname, tbl.relname AS tblname, idx.relname AS idxname, idx.reltuples, idx.relpages, idx.relam,"
+		" indrelid, indexrelid, indkey::smallint[] AS attnum,"
+		" coalesce(substring("
+		" array_to_string(idx.reloptions, \' \')"
+		" from \'fillfactor=([0-9]+)\')::smallint, 90) AS fillfactor"
+		" FROM pg_index"
+		" JOIN pg_class idx ON idx.oid=pg_index.indexrelid"
+		" JOIN pg_class tbl ON tbl.oid=pg_index.indrelid"
+		" JOIN pg_namespace ON pg_namespace.oid = idx.relnamespace"
+		" WHERE pg_index.indisvalid AND tbl.relkind = \'r\' AND idx.relpages > 0"
+		" ) AS i ON a.attrelid = i.indexrelid"
+		" JOIN pg_stats AS s ON s.schemaname = i.nspname"
+		" AND ((s.tablename = i.tblname AND s.attname = pg_catalog.pg_get_indexdef(a.attrelid, a.attnum, TRUE))"
+		" OR   (s.tablename = i.idxname AND s.attname = a.attname))"
+		" JOIN pg_type AS t ON a.atttypid = t.oid"
+		" WHERE a.attnum > 0"
+		" GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9"
+		" ) AS s1"
+		" ) AS s2"
+		" JOIN pg_am am ON s2.relam = am.oid WHERE am.amname = \'btree\'"
+		") AS sub"
+		" ORDER BY 2,3,4";
+}
+
+/*
+ * Add context to the errors produced by pglogical_execute_sql_command().
+ */
+static void
+execute_sql_command_error_cb(void *arg)
+{
+	errcontext("during execution of queued SQL statement: %s", (char *) arg);
+}
+
+static void
+execute_sql_command(char *cmdstr, bool isTopLevel, MemoryContext active_context)
+{
+	List	   *commands;
+	ListCell   *command_i;
+	ErrorContextCallback errcallback;
+
+	errcallback.callback = execute_sql_command_error_cb;
+	errcallback.arg = cmdstr;
+	errcallback.previous = error_context_stack;
+	error_context_stack = &errcallback;
+
+	MemoryContextSwitchTo(active_context);
+
+	commands = pg_parse_query(cmdstr);
+
+	/*
+	 * Do a limited amount of safety checking against CONCURRENTLY commands
+	 * executed in situations where they aren't allowed. The sender side should
+	 * provide protection, but better be safe than sorry.
+	 */
+	isTopLevel = isTopLevel && (list_length(commands) == 1);
+
+	foreach(command_i, commands)
+	{
+		List	   *plantree_list;
+		List	   *querytree_list;
+		Node	   *command = (Node *) lfirst(command_i);
+		const char *commandTag;
+		Portal		portal;
+		DestReceiver *receiver;
+
+		/* temporarily push snapshot for parse analysis/planning */
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		commandTag = CreateCommandTag(command);
+
+		querytree_list = pg_analyze_and_rewrite(
+			command, cmdstr, NULL, 0);
+
+		plantree_list = pg_plan_queries(
+			querytree_list, 0, NULL);
+
+		PopActiveSnapshot();
+
+		portal = CreatePortal("autoreindex", true, true);
+		PortalDefineQuery(portal, NULL,
+						  cmdstr, commandTag,
+						  plantree_list, NULL);
+		PortalStart(portal, NULL, 0, InvalidSnapshot);
+
+		receiver = CreateDestReceiver(DestNone);
+
+		(void) PortalRun(portal, FETCH_ALL,
+						 isTopLevel,
+						 receiver, receiver,
+						 NULL);
+		(*receiver->rDestroy) (receiver);
+
+		PortalDrop(portal, false);
+
+		CommandCounterIncrement();
+
+		MemoryContextSwitchTo(active_context);
+	}
+
+	/* protect against stack resets during CONCURRENTLY processing */
+	if (error_context_stack == &errcallback)
+		error_context_stack = errcallback.previous;
+}
+
+
 static void
 worker_main(Datum main_arg)
 {
 	int		index;
 	char	buf[MAXPGPATH];
+	MemoryContext oldcontext = CurrentMemoryContext;
 
-	elog(LOG, "worker %s started", WORKER_NAME);
+	if (verbose)
+		elog(LOG, "worker %s started", WORKER_NAME);
 
 	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
@@ -320,8 +483,9 @@ worker_main(Datum main_arg)
 	Assert(worker_slot != NULL);
 	Assert(worker_state != NULL);
 
-	elog(LOG, "worker %s is stared for database: %s",
-						WORKER_NAME, worker_slot->dbname);
+	if (verbose)
+		elog(LOG, "worker %s is stared for database: %s",
+							WORKER_NAME, worker_slot->dbname);
 
 	snprintf(buf, MAXPGPATH, "bgworker: %s (%s)", WORKER_NAME, worker_slot->dbname);
 	init_ps_display(buf, "", "", "");
@@ -338,20 +502,56 @@ worker_main(Datum main_arg)
 
 		SPI_connect();
 		PushActiveSnapshot(GetTransactionSnapshot());
-		pgstat_report_activity(STATE_RUNNING, "select pg_sleep((random()*10)::int)");
 
-		SPI_execute("select pg_sleep((random()*10)::int)", false, 1);
+		SPI_execute("set enable_nestloop to off", false, 0);
+
+		pgstat_report_activity(STATE_RUNNING, bloat_index_query());
+
+		SPI_execute(bloat_index_query(), false, 0);
+
+//		if (SPI_processed > 0)
+//		{
+//			int		i;
+//
+//			for (i = 0; i < SPI_processed; i++)
+//			{
+//				char *val = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 4);
+//
+//				elog(LOG, "%s", val);
+//			}
+//
+//		}
+
 
 		SPI_finish();
 		PopActiveSnapshot();
 		CommitTransactionCommand();
+
+		MemoryContextSwitchTo(oldcontext);
+
+		if (strcmp(worker_slot->dbname, "postgres") == 0)
+		{
+			char *query_string = "create index concurrently if not exists stehule on public.obce(nazev)";
+
+			StartTransactionCommand();
+
+			execute_sql_command(query_string, true, oldcontext);
+
+			CommitTransactionCommand();
+
+			break;
+		}
+
 	}
 	PG_CATCH();
 	{
 		ErrorData		*errdata;
 
+		MemoryContextSwitchTo(oldcontext);
+
 		errdata = CopyErrorData();
 		worker_report_feedback(errdata->saved_errno, errdata->sqlerrcode, errdata->message);
+
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -467,8 +667,9 @@ controller_main(Datum main_arg)
 					}
 					else
 					{
-						elog(LOG, "%s cannot to start worker %s",
-									CONTROLLER_NAME, WORKER_NAME);
+						if (verbose)
+							elog(LOG, "%s cannot to start worker %s",
+										CONTROLLER_NAME, WORKER_NAME);
 						slot->is_active = false;
 						goto wait;
 					}
@@ -483,7 +684,8 @@ wait:
 	terminate_workers();
 	cleanup_on_workers_exit();
 
-	elog(LOG, "%s finished", CONTROLLER_NAME);
+	if (verbose)
+		elog(LOG, "%s finished", CONTROLLER_NAME);
 	proc_exit(0);
 }
 
@@ -522,8 +724,9 @@ launch_worker_internal(uint32 segment, int index)
 
 	Assert(status == BGWH_STARTED);
 
-	elog(LOG, "Background worker %s pid: %d successfully started by controller %s",
-				  WORKER_NAME, pid, CONTROLLER_NAME);
+	if (verbose)
+		elog(LOG, "Background worker %s pid: %d successfully started by controller %s",
+					  WORKER_NAME, pid, CONTROLLER_NAME);
 
 	return handle;
 }
