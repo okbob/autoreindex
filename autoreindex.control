@@ -1,5 +1,5 @@
-comment = 'scheduler'
+comment = 'autoreindex'
 default_version = '1.0'
-module_pathname = '$libdir/scheduler'
+module_pathname = '$libdir/autoreindex'
 relocatable = true
 
