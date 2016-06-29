@@ -6,9 +6,12 @@
  */
 
 #include "postgres.h"
+#include "pgstat.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_type.h"
+#include "executor/spi.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/elog.h"
@@ -156,6 +159,69 @@ get_database_list(void)
 	CommitTransactionCommand();
 
 	MemoryContextSwitchTo(top_ctx);
+
+	return result;
+}
+
+/*
+ * Returns list of oid of bloated indexes in current database
+ * After call of this function, the resource owner should be set again.
+ *
+ */
+List *
+get_bloated_indexes_oid(float bloat_size_limit, float bloat_ratio_limit)
+{
+	List		*result = NIL;
+	MemoryContext top_cxt = CurrentMemoryContext;
+	Datum		values[2];
+	Oid			argtypes[2] = {FLOAT4OID, FLOAT4OID};
+	int			ret;
+	char		*bloat_query;
+
+	values[0] = Float4GetDatum((float4) bloat_size_limit);
+	values[1] = Float4GetDatum((float4) bloat_ratio_limit);
+
+	SetCurrentStatementStartTimestamp();
+	StartTransactionCommand();
+
+	SPI_connect();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	SPI_execute("set enable_nestloop to off", false, 0);
+
+	bloat_query = bloat_indexes_query(true);
+
+	pgstat_report_activity(STATE_RUNNING, bloat_query);
+
+	ret = SPI_execute_with_args(bloat_query, 2, argtypes, values, NULL, true, 0);
+
+	pgstat_report_activity(STATE_RUNNING, "bloat query processing");
+
+	if (ret != SPI_OK_SELECT)
+		elog(ERROR, "cannot to execute bloat indexes query");
+
+	if (SPI_processed > 0)
+	{
+		int		i;
+
+		for (i = 0; i < SPI_processed; i++)
+		{
+			char *val1 = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
+			char *val2 = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
+			char *val3 = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3);
+			char *val4 = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 4);
+			char *val5 = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 5);
+			char *val6 = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 6);
+
+			elog(LOG, "%s %s %s %s %s %s", val1, val2, val3, val4, val5, val6);
+		}
+	}
+
+	SPI_finish();
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	MemoryContextSwitchTo(top_cxt);
 
 	return result;
 }

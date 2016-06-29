@@ -85,6 +85,7 @@ typedef struct
 	int		workers_active;
 	List	*database_list;
 	ListCell	*current_dblc;
+	MemoryContext		database_list_mcxt;
 	dsm_segment			*data;
 	WorkerState					*worker_states;
 	BackgroundWorkerHandle		*worker_handles[MAX_WORKERS];
@@ -200,6 +201,11 @@ setup_controller(ControllerState *controller, dsm_segment *seg, WorkerState *sta
 	}
 	controller->database_list = NIL;
 	controller->current_dblc = NULL;
+	controller->database_list_mcxt = AllocSetContextCreate(CurrentMemoryContext,
+																  "Database list storage",
+															 ALLOCSET_DEFAULT_MINSIZE,
+															 ALLOCSET_DEFAULT_INITSIZE,
+															 ALLOCSET_DEFAULT_MAXSIZE);
 }
 
 /*
@@ -449,12 +455,16 @@ manage_workers(ControllerState *controller, bool *loop_completed)
 {
 	ListCell		*lc;
 
+
 	if (controller->database_list == NIL)
 	{
-		ResourceOwner ro = CurrentResourceOwner;
+		ResourceOwner	ro = CurrentResourceOwner;
+		MemoryContext	oldcxt;
 
+		oldcxt = MemoryContextSwitchTo(controller->database_list_mcxt);
 		controller->database_list = get_database_list();
 		CurrentResourceOwner = ro;
+		MemoryContextSwitchTo(oldcxt);
 		controller->current_dblc = NULL;
 	}
 
@@ -498,6 +508,17 @@ manage_workers(ControllerState *controller, bool *loop_completed)
 	}
 
 	*loop_completed = lc == NULL;
+
+	/*
+	 * Database list is used for only one iteration. Release it, when we
+	 * are on the end. The database list is usually short and with this technique
+	 * we should not to solve refreshing the content of database list.
+	 */
+	if (*loop_completed)
+	{
+		controller->database_list = NIL;
+		MemoryContextReset(controller->database_list_mcxt);
+	}
 
 	controller->current_dblc = lc;
 }
