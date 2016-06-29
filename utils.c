@@ -187,11 +187,11 @@ get_bloated_indexes_oid(float bloat_size_limit, float bloat_ratio_limit)
 	SPI_connect();
 	PushActiveSnapshot(GetTransactionSnapshot());
 
-	SPI_execute("set enable_nestloop to off", false, 0);
-
 	bloat_query = bloat_indexes_query(true);
 
 	pgstat_report_activity(STATE_RUNNING, bloat_query);
+
+	set_config_option("enable_nestloop", "off", PGC_USERSET, PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
 
 	ret = SPI_execute_with_args(bloat_query, 2, argtypes, values, NULL, true, 0);
 
