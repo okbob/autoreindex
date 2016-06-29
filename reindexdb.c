@@ -1,3 +1,10 @@
+/*
+ * autoreidex @ Pavel Stehule, 2016
+ *
+ * This function does hard work
+ *
+ */
+
 #include "postgres.h"
 #include "pgstat.h"
 #include "utils/memutils.h"

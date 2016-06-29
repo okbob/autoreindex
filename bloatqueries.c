@@ -1,3 +1,10 @@
+/*
+ * autoreidex @ Pavel Stehule, 2016
+ *
+ * Resource file - SQL queries builder
+ *
+ */
+
 #include "postgres.h"
 
 #include "lib/stringinfo.h"

@@ -1,3 +1,9 @@
+/*
+ * autoreidex @ Pavel Stehule, 2016
+ *
+ * Public declarations
+ *
+ */
 
 #include "nodes/pg_list.h"
 

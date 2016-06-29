@@ -1,3 +1,11 @@
+/*
+ * autoreidex @ Pavel Stehule, 2016
+ *
+ * Infrastructure for maintaining controller and controlled
+ * bacground worker processes
+ *
+ */
+
 #include "postgres.h"
 #include "miscadmin.h"
 #include "pgstat.h"
