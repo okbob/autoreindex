@@ -7,20 +7,22 @@
 
 #include "postgres.h"
 #include "pgstat.h"
-#include "utils/memutils.h"
 #include "utils/palloc.h"
 #include "utils/resowner.h"
 
 #include "autoreindex.h"
 
 /*
- * run statements via sql exec */
+ * This routine is executed only one time, so there are no necessary to create temporary
+ * memory context. When this function finish, then the process will be terminated. 
+ */
 void
 reindex_current_database(int options)
 {
 	ResourceOwner ro = CurrentResourceOwner;
-	MemoryContext tmpcxt;
-	MemoryContext oldcxt;
+	MemoryContext mcxt = CurrentMemoryContext;
+	List		*candidates;
+	ListCell	*lc;
 
 	char *cmdstr =
 					"do $$\n"
@@ -30,24 +32,35 @@ reindex_current_database(int options)
 					"  raise log 'plpgsql ended';\n"
 					"end $$";
 
-	tmpcxt =  AllocSetContextCreate(CurrentMemoryContext,
-																  "Short life background worker context",
-															 ALLOCSET_DEFAULT_MINSIZE,
-															 ALLOCSET_DEFAULT_INITSIZE,
-															 ALLOCSET_DEFAULT_MAXSIZE);
+	candidates = get_bloated_indexes_oid(0.0, 0.0);
 
-	oldcxt = MemoryContextSwitchTo(tmpcxt);
-
-	get_bloated_indexes_oid(0.0, 0.0);
-
-	MemoryContextSwitchTo(tmpcxt);
+	MemoryContextSwitchTo(mcxt);
 	CurrentResourceOwner = ro;
 
-	autoreindex_execute_single_sql_command(cmdstr, true, tmpcxt);
+	foreach(lc, candidates)
+	{
+		autoreindex_index_desc *idx_desc;
+		bool		is_valid;
+		bool		is_system;
 
-	MemoryContextSwitchTo(oldcxt);
-	MemoryContextDelete(tmpcxt);
+		idx_desc = (autoreindex_index_desc *) lfirst(lc);
+		is_system = is_system_class(idx_desc->indrel_id, &is_valid);
 
-	CurrentResourceOwner = ro;
+		if (!is_valid)
+			continue;			/* dropped by other process */
+
+		if (is_system || idx_desc->is_primary)
+		{
+			/* It is not supported yet */
+			elog(LOG, "skip system index or primary index");
+			continue;
+		}
+
+
+		elog(LOG, "index oid: %d, name: \"%s\", def: \"%s\"", idx_desc->index_id, idx_desc->indexname, get_indexdef(idx_desc->index_id));
+	}
+
+
+	autoreindex_execute_single_sql_command(cmdstr, true, mcxt);
 }
 

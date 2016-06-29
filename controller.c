@@ -56,6 +56,12 @@ static bool			hide_ctx = true;
 
 typedef struct
 {
+	/* ----------------------------- */
+	bool		is_active;
+	Oid			db_oid;
+	Oid			index_oid;
+	/* ---- updated under locks ---- */
+
 	bool	is_valid;
 	int		stat_processed_tables;
 
@@ -69,6 +75,7 @@ typedef struct
  */
 typedef struct
 {
+	Oid			db_oid;
 	char		dbname[NAMEDATALEN];
 	int			worker_state_slot_number;
 	int			options;
@@ -83,6 +90,7 @@ emit_log_hook_type previous_log_hook = NULL;
  */
 typedef struct
 {
+	Oid			db_oid;
 	char		dbname[NAMEDATALEN];
 
 } WorkerPrivateData;

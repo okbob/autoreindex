@@ -7,15 +7,20 @@
 
 #include "postgres.h"
 #include "pgstat.h"
+#include "access/htup.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
+#include "catalog/catalog.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
+#include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 
 #include "autoreindex.h"
 
@@ -178,6 +183,11 @@ get_bloated_indexes_oid(float bloat_size_limit, float bloat_ratio_limit)
 	int			ret;
 	char		*bloat_query;
 
+	int		indexrelid_col;
+	int		indrelid_col;
+	int		indisprimary_col;
+	int		idxname_col;
+
 	values[0] = Float4GetDatum((float4) bloat_size_limit);
 	values[1] = Float4GetDatum((float4) bloat_ratio_limit);
 
@@ -204,16 +214,50 @@ get_bloated_indexes_oid(float bloat_size_limit, float bloat_ratio_limit)
 	{
 		int		i;
 
+		indexrelid_col = SPI_fnumber(SPI_tuptable->tupdesc, "indexrelid");
+		if (indexrelid_col == SPI_ERROR_NOATTRIBUTE)
+			elog(ERROR, "cannot find column \"indexrelid\" in bloat query result");
+
+		indrelid_col = SPI_fnumber(SPI_tuptable->tupdesc, "table_oid");
+		if (indrelid_col == SPI_ERROR_NOATTRIBUTE)
+			elog(ERROR, "cannot find column \"table_oid\" in bloat query result");
+
+		indisprimary_col = SPI_fnumber(SPI_tuptable->tupdesc, "indisprimary");
+		if (indisprimary_col == SPI_ERROR_NOATTRIBUTE)
+			elog(ERROR, "cannot find column \"indisprimary\" in bloat query result");
+
+		idxname_col = SPI_fnumber(SPI_tuptable->tupdesc, "idxname");
+		if (idxname_col == SPI_ERROR_NOATTRIBUTE)
+			elog(ERROR, "cannot find column \"idxname\" in bloat query result");
+
+		/* switch to persistent memory context */
+		MemoryContextSwitchTo(top_cxt);
+
 		for (i = 0; i < SPI_processed; i++)
 		{
-			char *val1 = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1);
-			char *val2 = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2);
-			char *val3 = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 3);
-			char *val4 = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 4);
-			char *val5 = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 5);
-			char *val6 = SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 6);
+			autoreindex_index_desc	*idx_desc = palloc(sizeof(autoreindex_index_desc));
+			bool		isnull;
+			text		*idxname;
 
-			elog(LOG, "%s %s %s %s %s %s", val1, val2, val3, val4, val5, val6);
+			idx_desc->index_id = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, indexrelid_col, &isnull));
+			if (isnull)
+				elog(ERROR, "indexrelid is NULL");
+
+			idx_desc->indrel_id = DatumGetObjectId(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, indrelid_col, &isnull));
+			if (isnull)
+				elog(ERROR, "indrelid is NULL");
+
+			idx_desc->is_primary = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, indisprimary_col, &isnull));
+			if (isnull)
+				elog(ERROR, "indisprimary is NULL");
+
+			idxname = DatumGetTextP(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, idxname_col, &isnull));
+			if (isnull)
+				elog(ERROR, "idxname is NULL");
+
+			idx_desc->indexname = text_to_cstring(idxname);
+
+			result = lappend(result, idx_desc);
 		}
 	}
 
@@ -222,6 +266,62 @@ get_bloated_indexes_oid(float bloat_size_limit, float bloat_ratio_limit)
 	CommitTransactionCommand();
 
 	MemoryContextSwitchTo(top_cxt);
+
+	return result;
+}
+
+bool
+is_system_class(Oid reloid, bool *is_valid)
+{
+	HeapTuple		tuple;
+	ResourceOwner ro = CurrentResourceOwner;
+	MemoryContext oldcxt = CurrentMemoryContext;
+	bool		result = false;;
+
+	StartTransactionCommand();
+	(void) GetTransactionSnapshot();
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(reloid));
+	if (HeapTupleIsValid(tuple))
+	{
+		Form_pg_class form;
+
+		*is_valid = true;
+		form = (Form_pg_class) GETSTRUCT(tuple);
+
+		result = IsSystemClass(reloid, form);
+	}
+	else
+		*is_valid = false;
+
+	ReleaseSysCache(tuple);
+	CommitTransactionCommand();
+
+	MemoryContextSwitchTo(oldcxt);
+	CurrentResourceOwner = ro;
+
+	return result;
+}
+
+char *
+get_indexdef(Oid indexid)
+{
+	ResourceOwner ro = CurrentResourceOwner;
+	MemoryContext oldcxt = CurrentMemoryContext;
+	text *indexdef_text;
+	char *result;
+
+	StartTransactionCommand();
+
+	indexdef_text = DatumGetTextP(DirectFunctionCall1(pg_get_indexdef, ObjectIdGetDatum(indexid)));
+
+	MemoryContextSwitchTo(oldcxt);
+	result = text_to_cstring(indexdef_text);
+
+	CommitTransactionCommand();
+
+	MemoryContextSwitchTo(oldcxt);
+	CurrentResourceOwner = ro;
 
 	return result;
 }
