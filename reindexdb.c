@@ -7,6 +7,7 @@
 
 #include "postgres.h"
 #include "pgstat.h"
+#include "storage/spin.h"
 #include "utils/palloc.h"
 #include "utils/resowner.h"
 
@@ -17,7 +18,7 @@
  * memory context. When this function finish, then the process will be terminated. 
  */
 void
-reindex_current_database(int options)
+reindex_current_database(int options,  slock_t *mutex, WorkerState *worker_state, WorkerState *states)
 {
 	ResourceOwner ro = CurrentResourceOwner;
 	MemoryContext mcxt = CurrentMemoryContext;
@@ -58,6 +59,12 @@ reindex_current_database(int options)
 
 
 		elog(LOG, "index oid: %d, name: \"%s\", def: \"%s\"", idx_desc->index_id, idx_desc->indexname, get_indexdef(idx_desc->index_id));
+
+		SpinLockAcquire(mutex);
+
+
+		SpinLockRelease(mutex);
+
 	}
 
 

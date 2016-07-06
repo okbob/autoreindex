@@ -152,8 +152,13 @@ get_database_list(void)
 
 		if (pgdatabase->datallowconn)
 		{
+			DatabaseDesc *desc;
+
 			old_ctx = MemoryContextSwitchTo(top_ctx);
-			result = lappend(result, pstrdup(NameStr(pgdatabase->datname)));
+			desc = (DatabaseDesc *) palloc(sizeof(DatabaseDesc));
+			desc->dboid = HeapTupleGetOid(tup);
+			strcpy(desc->dbname, NameStr(pgdatabase->datname));
+			result = lappend(result, desc);
 			MemoryContextSwitchTo(old_ctx);
 		}
 	}

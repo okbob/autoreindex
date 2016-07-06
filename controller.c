@@ -15,6 +15,7 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/shm_toc.h"
+#include "storage/spin.h"
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
 #include "utils/memutils.h"
@@ -46,36 +47,11 @@ static bool			verbose = false;
 static bool			hide_ctx = true;
 
 /*
- * Worker state holds result of worker execution. It is reseted
- * by controller (is_done = false) before worker start, and it
- * filled by worker when worker is ending. This structure is in
- * shared memory. Workers get possition of in the array of
- * WorkerStates.
- */
-#define			MAX_ERROR_MESSAGE_LEN		1024
-
-typedef struct
-{
-	/* ----------------------------- */
-	bool		is_active;
-	Oid			db_oid;
-	Oid			index_oid;
-	/* ---- updated under locks ---- */
-
-	bool	is_valid;
-	int		stat_processed_tables;
-
-	int		exitcode;
-	int		sqlstate;
-	char	errormessage[MAX_ERROR_MESSAGE_LEN];
-} WorkerState;
-
-/*
  * These data will be copied to the worker with bgw_extra.
  */
 typedef struct
 {
-	Oid			db_oid;
+	Oid			dboid;
 	char		dbname[NAMEDATALEN];
 	int			worker_state_slot_number;
 	int			options;
@@ -84,13 +60,15 @@ typedef struct
 /* The context for LOG level is overhead, should be disabled */
 emit_log_hook_type previous_log_hook = NULL;
 
+/* spin lock for access to shared memory */
+slock_t *mutex;
 
 /*
  * Holds privated data about active worker - owned by controller.
  */
 typedef struct
 {
-	Oid			db_oid;
+	Oid			dboid;
 	char		dbname[NAMEDATALEN];
 
 } WorkerPrivateData;
@@ -109,6 +87,7 @@ typedef struct
 } ControllerState;
 
 static WorkerState			*worker_state;
+static WorkerState			*worker_states;
 static WorkerStartupParams	*worker_startup_params;				/* Worker Startup Params */
 
 
@@ -118,7 +97,7 @@ static WorkerStartupParams	*worker_startup_params;				/* Worker Startup Params *
 static void setup_controller(ControllerState *controller, dsm_segment *seg,
 															  WorkerState *states, int nworkers);
 static void manage_workers(ControllerState *controller, bool *loop_completed);
-static bool launch_worker(ControllerState *controller, char *dbname, int options);
+static bool launch_worker(ControllerState *controller, char *dbname, Oid dboid, int options);
 static BackgroundWorkerHandle *launch_worker_internal(uint32 segment, WorkerStartupParams *params);
 
 
@@ -181,7 +160,8 @@ setup_dynamic_shared_memory(ControllerState *controller, int nworkers)
 	/* Estimate how much shared memory we need */
 	shm_toc_initialize_estimator(&e);
 	shm_toc_estimate_chunk(&e, nworkers * sizeof(WorkerState));
-	shm_toc_estimate_keys(&e, 1);
+	shm_toc_estimate_chunk(&e, sizeof(slock_t));
+	shm_toc_estimate_keys(&e, 2);
 	segsize = shm_toc_estimate(&e);
 
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, CONTROLLER_NAME);
@@ -192,6 +172,11 @@ setup_dynamic_shared_memory(ControllerState *controller, int nworkers)
 
 	states = shm_toc_allocate(toc, nworkers * sizeof(WorkerState));
 	shm_toc_insert(toc, 1, states);
+
+	mutex = shm_toc_allocate(toc, sizeof(slock_t));
+	shm_toc_insert(toc, 2, mutex);
+
+	SpinLockInit(&mutex);
 
 	setup_controller(controller, seg, states, nworkers);
 }
@@ -244,6 +229,8 @@ setup_worker_state(int segmentno, WorkerStartupParams *params)
 		elog(ERROR, "bad magic number in dynamic memory segment");
 
 	worker_state = &((WorkerState *) shm_toc_lookup(toc, 1))[params->worker_state_slot_number];
+	worker_states = (WorkerState *) shm_toc_lookup(toc, 1);
+	mutex = (slock_t *) shm_toc_lookup(toc, 2);
 
 	/* Clean result state, and the state is valid now. */
 	worker_state->is_valid = true;
@@ -292,6 +279,8 @@ cleanup_on_workers_exit(ControllerState *controller)
 			}
 
 			state->is_valid = false;
+			state->dboid = InvalidOid;
+
 			controller->worker_handles[i] = NULL;
 			controller->workers_active--;
 		}
@@ -366,7 +355,7 @@ worker_main(Datum main_arg)
 
 		pgstat_report_activity(STATE_RUNNING, "reindexing database");
 
-		reindex_current_database(wsp.options);
+		reindex_current_database(wsp.options, mutex, worker_state, worker_states);
 	}
 	PG_CATCH();
 	{
@@ -494,7 +483,7 @@ manage_workers(ControllerState *controller, bool *loop_completed)
 	/* repeat to last database when active workers are less than total workers */
 	while (controller->workers_active < controller->workers_total && lc != NULL)
 	{
-		char	*dbname = (char *) lfirst(lc);
+		DatabaseDesc *desc = (DatabaseDesc *) lfirst(lc);
 		int		 nworkers = 0;
 		int		 i;
 
@@ -502,8 +491,11 @@ manage_workers(ControllerState *controller, bool *loop_completed)
 		for (i = 0; i < controller->workers_total; i++)
 		{
 			if (controller->worker_handles[i] != NULL &&
-					strcmp(controller->workers[i].dbname, dbname) == 0)
-				nworkers++;
+					controller->workers[i].dboid == desc->dboid)
+			{
+				if (++nworkers >= max_workers_per_database)
+					break;
+			}
 		}
 
 		if (nworkers >= max_workers_per_database)
@@ -512,7 +504,7 @@ manage_workers(ControllerState *controller, bool *loop_completed)
 			continue;
 		}
 
-		if (!launch_worker(controller, dbname, 0))
+		if (!launch_worker(controller, desc->dbname, desc->dboid, 0))
 		{
 			if (verbose)
 					elog(LOG, "%s cannot to start worker %s",
@@ -549,7 +541,7 @@ manage_workers(ControllerState *controller, bool *loop_completed)
  * parameters, then handle is saved and true is returned.
  */
 static bool
-launch_worker(ControllerState *controller, char *dbname, int options)
+launch_worker(ControllerState *controller, char *dbname, Oid dboid, int options)
 {
 	int			i;
 
@@ -560,18 +552,21 @@ launch_worker(ControllerState *controller, char *dbname, int options)
 			WorkerStartupParams params;
 			BackgroundWorkerHandle *handle;
 
+			params.dboid = dboid;
 			strncpy(params.dbname, dbname, NAMEDATALEN);
 			params.worker_state_slot_number = i;
 			params.options = options;
 
 			controller->worker_states[i].is_valid = false;
+			controller->worker_states[i].dboid = dboid;
+
+			controller->workers[i].dboid = dboid;
+			strncpy(controller->workers[i].dbname, dbname, NAMEDATALEN);
 
 			handle = launch_worker_internal(dsm_segment_handle(controller->data), &params);
 			if (handle != NULL)
 			{
 				controller->worker_handles[i] = handle;
-				strncpy(controller->workers[i].dbname, dbname, NAMEDATALEN);
-
 				return true;
 			}
 		}
